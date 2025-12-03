@@ -53,10 +53,11 @@ Makefile
 
 # Visual Studio
 .vs/
-*.vcxproj
-*.vcxproj.filters
+# Keep our custom VS project
+!rats_native.vcxproj
+!rats_native.vcxproj.filters
 *.vcxproj.user
-*.sln
+# *.sln
 *.suo
 *.ncb
 *.aps

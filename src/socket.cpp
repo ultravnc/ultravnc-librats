@@ -682,6 +682,9 @@ std::vector<uint8_t> receive_exact_bytes(socket_t socket, size_t num_bytes) {
     result.reserve(num_bytes);
     
     size_t total_received = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    const int timeout_seconds = 5;
+    
     while (total_received < num_bytes) {
         std::vector<uint8_t> buffer(num_bytes - total_received);
         int bytes_received = recv(socket, reinterpret_cast<char*>(buffer.data()), buffer.size(), 0);
@@ -690,6 +693,13 @@ std::vector<uint8_t> receive_exact_bytes(socket_t socket, size_t num_bytes) {
 #ifdef _WIN32
             int error = WSAGetLastError();
             if (error == WSAEWOULDBLOCK) {
+                // Check for timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_time).count();
+                if (elapsed >= timeout_seconds) {
+                    LOG_SOCKET_ERROR("Timeout waiting for data on socket " << socket);
+                    return std::vector<uint8_t>();
+                }
                 // No data available on non-blocking socket - try again
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
@@ -698,6 +708,13 @@ std::vector<uint8_t> receive_exact_bytes(socket_t socket, size_t num_bytes) {
 #else
             int error = errno;
             if (error == EAGAIN || error == EWOULDBLOCK) {
+                // Check for timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - start_time).count();
+                if (elapsed >= timeout_seconds) {
+                    LOG_SOCKET_ERROR("Timeout waiting for data on socket " << socket);
+                    return std::vector<uint8_t>();
+                }
                 // No data available on non-blocking socket - try again
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
