@@ -50,6 +50,18 @@ using NodeId = std::array<uint8_t, NODE_ID_SIZE>;
 using InfoHash = std::array<uint8_t, NODE_ID_SIZE>;
 
 /**
+ * Search node state flags (bitfield)
+ * Flags can be combined to track the full history of a node in a search.
+ */
+namespace SearchNodeFlags {
+    constexpr uint8_t QUERIED       = 1 << 0;  // Query has been sent to this node
+    constexpr uint8_t SHORT_TIMEOUT = 1 << 1;  // Node exceeded short timeout (slot freed, still waiting)
+    constexpr uint8_t RESPONDED     = 1 << 2;  // Node successfully responded
+    constexpr uint8_t TIMED_OUT     = 1 << 3;  // Node fully timed out (failed)
+    constexpr uint8_t ABANDONED     = 1 << 4;  // Node was discarded during search truncation
+}
+
+/**
  * DHT Node information
  */
 struct DhtNode {
@@ -68,6 +80,25 @@ struct DhtNode {
  * Peer discovery callback
  */
 using PeerDiscoveryCallback = std::function<void(const std::vector<Peer>& peers, const InfoHash& info_hash)>;
+
+/**
+ * Deferred callbacks structure for avoiding deadlock
+ * Callbacks are collected while holding the mutex, then invoked after releasing it
+ */
+struct DeferredCallbacks {
+    std::vector<PeerDiscoveryCallback> callbacks;
+    std::vector<Peer> peers;
+    InfoHash info_hash;
+    bool should_invoke = false;
+    
+    void invoke() {
+        if (should_invoke) {
+            for (const auto& cb : callbacks) {
+                if (cb) cb(peers, info_hash);
+            }
+        }
+    }
+};
 
 /**
  * DHT Kademlia implementation
@@ -113,11 +144,9 @@ public:
      * Find peers for a specific info hash
      * @param info_hash The info hash to search for
      * @param callback Callback to receive discovered peers
-     * @param iteration_max Maximum number of search iterations (default: 1, 0 = infinite)
-     * @param alpha_max Maximum DHT alpha (default: 1, usually between 3 and 6)
      * @return true if search started successfully, false otherwise
      */
-    bool find_peers(const InfoHash& info_hash, PeerDiscoveryCallback callback, int iteration_max = 1, int alpha_max = 1);
+    bool find_peers(const InfoHash& info_hash, PeerDiscoveryCallback callback);
     
     /**
      * Announce that this node is a peer for a specific info hash
@@ -169,18 +198,17 @@ private:
     // ============================================================================
     // When acquiring multiple mutexes, ALWAYS follow this order:
     //
-    // 1. pending_pings_mutex_           (Ping verification state)
-    // 2. nodes_being_replaced_mutex_    (Node replacement tracking)
-    // 3. pending_searches_mutex_        (Search state and transaction mappings)
-    // 4. routing_table_mutex_           (core routing data)
-    // 5. pending_announces_mutex_       (Announce state)
-    // 6. announced_peers_mutex_         (Stored peer data)
-    // 7. peer_tokens_mutex_             (Token validation data)
-    // 8. shutdown_mutex_                (Lowest priority - can be locked independently)
+    // 1. pending_pings_mutex_           (Ping verification state, nodes_being_replaced_, candidates_being_pinged_)
+    // 2. pending_searches_mutex_        (Search state and transaction mappings)
+    // 3. routing_table_mutex_           (core routing data)
+    // 4. pending_announces_mutex_       (Announce state)
+    // 5. announced_peers_mutex_         (Stored peer data)
+    // 6. peer_tokens_mutex_             (Token validation data)
+    // 7. shutdown_mutex_                (Lowest priority - can be locked independently)
     //
     // Routing table (k-buckets)
     std::vector<std::vector<DhtNode>> routing_table_;
-    mutable std::mutex routing_table_mutex_;  // Lock order: 4
+    mutable std::mutex routing_table_mutex_;  // Lock order: 3
     
     // Tokens for peers (use Peer directly as key for efficiency)
     struct PeerToken {
@@ -192,7 +220,7 @@ private:
             : token(t), created_at(std::chrono::steady_clock::now()) {}
     };
     std::unordered_map<Peer, PeerToken> peer_tokens_;
-    std::mutex peer_tokens_mutex_;  // Lock order: 7
+    std::mutex peer_tokens_mutex_;  // Lock order: 6
     
 
     // Pending announce tracking (for BEP 5 compliance)
@@ -205,31 +233,46 @@ private:
             : info_hash(hash), port(p), created_at(std::chrono::steady_clock::now()) {}
     };
     std::unordered_map<std::string, PendingAnnounce> pending_announces_;
-    std::mutex pending_announces_mutex_;  // Lock order: 5
+    std::mutex pending_announces_mutex_;  // Lock order: 4
     
     // Pending find_peers tracking (to map transaction IDs to info_hash)
     struct PendingSearch {
         InfoHash info_hash;
         std::chrono::steady_clock::time_point created_at;
-        std::chrono::steady_clock::time_point updated_at;
         
-        // Iterative search state
-        std::unordered_set<std::string> queried_nodes;  // node_id as hex string
-        int iteration_count;                            // current iteration number
-        int iteration_max;                              // maximum iteration limit
-        bool is_finished;                                 // whether the search is finished
+        // Iterative search state - search_nodes is sorted by distance to info_hash (closest first)
+        std::vector<DhtNode> search_nodes;
+        std::vector<Peer> found_peers;          // found peers for this search
+        // Single map tracking node states using SearchNodeFlags bitfield
+        // A node is "known" if it exists in this map (any flags set or value 0)
+        std::unordered_map<NodeId, uint8_t> node_states;
+        
+        int invoke_count;                           // number of outstanding requests
+        int branch_factor;                          // adaptive concurrency limit (starts at ALPHA)
+        bool is_finished;                           // whether the search is finished
 
         // Callbacks to invoke when peers are found (supports multiple concurrent searches for same info_hash)
         std::vector<PeerDiscoveryCallback> callbacks;
         
-        PendingSearch(const InfoHash& hash, int max_iterations = 1)
+        PendingSearch(const InfoHash& hash)
             : info_hash(hash), created_at(std::chrono::steady_clock::now()), 
-              updated_at(std::chrono::steady_clock::now()),
-              iteration_count(1), iteration_max(max_iterations), is_finished(false) {}
+              invoke_count(0), branch_factor(ALPHA), is_finished(false) {}
     };
     std::unordered_map<std::string, PendingSearch> pending_searches_; // info_hash (hex) -> PendingSearch
-    std::mutex pending_searches_mutex_;  // Lock order: 3
-    std::unordered_map<std::string, std::string> transaction_to_search_; // transaction_id -> info_hash (hex)
+    std::mutex pending_searches_mutex_;  // Lock order: 2
+    
+    // Transaction tracking with queried node info for proper responded_nodes tracking
+    struct SearchTransaction {
+        std::string info_hash_hex;
+        NodeId queried_node_id;
+        std::chrono::steady_clock::time_point sent_at;
+        
+        SearchTransaction() = default;
+        SearchTransaction(const std::string& hash, const NodeId& id)
+            : info_hash_hex(hash), queried_node_id(id), 
+              sent_at(std::chrono::steady_clock::now()) {}
+    };
+    std::unordered_map<std::string, SearchTransaction> transaction_to_search_; // transaction_id -> SearchTransaction
     
     // Peer announcement storage (BEP 5 compliant)
     struct AnnouncedPeer {
@@ -241,7 +284,7 @@ private:
     };
     // Map from info_hash (as hex string) to list of announced peers
     std::unordered_map<std::string, std::vector<AnnouncedPeer>> announced_peers_;
-    std::mutex announced_peers_mutex_;  // Lock order: 6
+    std::mutex announced_peers_mutex_;  // Lock order: 5
     
     // Ping-before-replace eviction tracking
     struct PingVerification {
@@ -249,19 +292,15 @@ private:
         DhtNode old_node;            // The existing node to potentially replace
         int bucket_index;            // Which bucket this affects
         std::chrono::steady_clock::time_point ping_sent_at;
-        std::string transaction_id;  // Transaction ID of the ping
         
-        PingVerification(const DhtNode& candidate, const DhtNode& old, int bucket_idx, const std::string& trans_id)
+        PingVerification(const DhtNode& candidate, const DhtNode& old, int bucket_idx)
             : candidate_node(candidate), old_node(old), bucket_index(bucket_idx), 
-              ping_sent_at(std::chrono::steady_clock::now()), transaction_id(trans_id) {}
+              ping_sent_at(std::chrono::steady_clock::now()) {}
     };
     std::unordered_map<std::string, PingVerification> pending_pings_;  // transaction_id -> PingVerification
     std::unordered_set<NodeId> candidates_being_pinged_; // Track candidate nodes that are currently being pinged to avoid duplicate pings
-    mutable std::mutex pending_pings_mutex_;  // Lock order: 1
-    
-    // Track nodes that have pending ping verifications to avoid duplicate pings
-    std::unordered_set<NodeId> nodes_being_replaced_;
-    mutable std::mutex nodes_being_replaced_mutex_;  // Lock order: 2
+    std::unordered_set<NodeId> nodes_being_replaced_;    // Track nodes that have pending ping verifications
+    mutable std::mutex pending_pings_mutex_;  // Lock order: 1 (protects pending_pings_, candidates_being_pinged_, nodes_being_replaced_)
     
     // Network thread
     std::thread network_thread_;
@@ -269,7 +308,7 @@ private:
     
     // Conditional variables for immediate shutdown
     std::condition_variable shutdown_cv_;
-    std::mutex shutdown_mutex_;  // Lock order: 8 (can be locked independently)
+    std::mutex shutdown_mutex_;  // Lock order: 7 (can be locked independently)
     
     // Helper functions
     void network_loop();
@@ -287,12 +326,6 @@ private:
     void handle_krpc_response(const KrpcMessage& message, const Peer& sender);
     void handle_krpc_error(const KrpcMessage& message, const Peer& sender);
     
-    // KRPC protocol sending functions
-    void send_ping(const Peer& peer);
-    void send_find_node(const Peer& peer, const NodeId& target);
-    void send_get_peers(const Peer& peer, const InfoHash& info_hash);
-    void send_announce_peer(const Peer& peer, const InfoHash& info_hash, uint16_t port, const std::string& token);
-    
     // KRPC protocol sending
     bool send_krpc_message(const KrpcMessage& message, const Peer& peer);
     void send_krpc_ping(const Peer& peer);
@@ -300,8 +333,7 @@ private:
     void send_krpc_get_peers(const Peer& peer, const InfoHash& info_hash);
     void send_krpc_announce_peer(const Peer& peer, const InfoHash& info_hash, uint16_t port, const std::string& token);
     
-    void add_node(const DhtNode& node, std::string transaction_id = "", bool verify = true);
-    void on_node_added(const DhtNode& node, std::string transaction_id);
+    void add_node(const DhtNode& node, bool verify = true);
     std::vector<DhtNode> find_closest_nodes(const NodeId& target, size_t count = K_BUCKET_SIZE);
     std::vector<DhtNode> find_closest_nodes_unlocked(const NodeId& target, size_t count = K_BUCKET_SIZE);
     int get_bucket_index(const NodeId& id);
@@ -326,9 +358,12 @@ private:
     
     // Pending search management
     void cleanup_stale_searches();
+    void cleanup_timed_out_search_requests();
     void handle_get_peers_response_for_search(const std::string& transaction_id, const Peer& responder, const std::vector<Peer>& peers);
     void handle_get_peers_response_with_nodes(const std::string& transaction_id, const Peer& responder, const std::vector<KrpcNode>& nodes);
-    bool continue_search_iteration(PendingSearch& search);
+    void handle_get_peers_empty_response(const std::string& transaction_id, const Peer& responder);
+    bool add_search_requests(PendingSearch& search, DeferredCallbacks& deferred);
+    void add_node_to_search(PendingSearch& search, const DhtNode& node);
     
     // Peer announcement storage management
     void store_announced_peer(const InfoHash& info_hash, const Peer& peer);
@@ -336,7 +371,7 @@ private:
     void cleanup_stale_announced_peers();
     
     // Ping-before-replace eviction management
-    void initiate_ping_verification(const DhtNode& candidate_node, const DhtNode& old_node, int bucket_index, std::string transaction_id = "");
+    void initiate_ping_verification(const DhtNode& candidate_node, const DhtNode& old_node, int bucket_index);
     void handle_ping_verification_response(const std::string& transaction_id, const NodeId& responder_id, const Peer& responder);
     void cleanup_stale_ping_verifications();
     bool perform_replacement(const DhtNode& candidate_node, const DhtNode& node_to_replace, int bucket_index);

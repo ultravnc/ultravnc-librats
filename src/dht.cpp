@@ -126,20 +126,20 @@ bool DhtClient::bootstrap(const std::vector<Peer>& bootstrap_nodes) {
     // Send ping to bootstrap nodes
     LOG_DHT_DEBUG("Sending PING to all bootstrap nodes");
     for (const auto& peer : bootstrap_nodes) {
-        send_ping(peer);
+        send_krpc_ping(peer);
     }
     
     // Start node discovery by finding our own node
     LOG_DHT_DEBUG("Starting node discovery by finding our own node ID: " << node_id_to_hex(node_id_));
     for (const auto& peer : bootstrap_nodes) {
-        send_find_node(peer, node_id_);
+        send_krpc_find_node(peer, node_id_);
     }
     
     LOG_DHT_DEBUG("Bootstrap process initiated");
     return true;
 }
 
-bool DhtClient::find_peers(const InfoHash& info_hash, PeerDiscoveryCallback callback, int iteration_max, int alpha_max) {
+bool DhtClient::find_peers(const InfoHash& info_hash, PeerDiscoveryCallback callback) {
     if (!running_) {
         LOG_DHT_ERROR("DHT client not running");
         return false;
@@ -148,9 +148,20 @@ bool DhtClient::find_peers(const InfoHash& info_hash, PeerDiscoveryCallback call
     std::string hash_key = node_id_to_hex(info_hash);
     LOG_DHT_INFO("Finding peers for info hash: " << hash_key);
     
-    // Check if a search is already ongoing for this info_hash
+    // Get initial nodes from routing table
+    auto closest_nodes = find_closest_nodes(info_hash, K_BUCKET_SIZE);
+    
+    if (closest_nodes.empty()) {
+        LOG_DHT_WARN("No nodes in routing table to query for info_hash " << hash_key);
+        return false;
+    }
+    
+    DeferredCallbacks deferred;
+    
     {
         std::lock_guard<std::mutex> lock(pending_searches_mutex_);
+        
+        // Check if a search is already ongoing for this info_hash
         auto search_it = pending_searches_.find(hash_key);
         if (search_it != pending_searches_.end()) {
             // Search already in progress - just add the callback to the list
@@ -158,135 +169,25 @@ bool DhtClient::find_peers(const InfoHash& info_hash, PeerDiscoveryCallback call
             search_it->second.callbacks.push_back(callback);
             return true;
         }
-    } // Release pending_searches_mutex_ here before cleanup
-    
-    // Smart cleanup: only clear ping verifications from overfilled buckets (which fully filled with nodes overfiled with ping requests)
-    // Working only with ping verifications for fully filled buckets
-    // This creates space for new search nodes pings queries while preserving valid ping verifications
-    {
-        std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
-        std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
-        std::lock_guard<std::mutex> search_lock(pending_searches_mutex_);
-        std::lock_guard<std::mutex> routing_lock(routing_table_mutex_);
         
-        // Count pending pings per bucket
-        std::unordered_map<int, std::vector<std::string>> bucket_pending_pings;
-        for (const auto& ping_pair : pending_pings_) {
-            int bucket_idx = ping_pair.second.bucket_index;
-            bucket_pending_pings[bucket_idx].push_back(ping_pair.first);
-        }
+        // Create new search
+        PendingSearch new_search(info_hash);
+        new_search.callbacks.push_back(callback);
         
-        size_t total_cleared = 0;
+        // Initialize search_nodes with closest nodes from routing table (already sorted)
+        new_search.search_nodes = std::move(closest_nodes);
         
-        // Check each bucket and clear pings from overfilled buckets
-        for (const auto& bucket_pings : bucket_pending_pings) {
-            int bucket_idx = bucket_pings.first;
-            const auto& ping_trans_ids = bucket_pings.second;
-            
-            // Get current bucket size
-            size_t bucket_size = routing_table_[bucket_idx].size();
-            size_t pending_count = ping_trans_ids.size();
-            
-            // Calculate how many free slots we need (at least ALPHA)
-            // A bucket is overfilled if: available_slots - slots_blocked_by_pings < ALPHA
-            int available_slots = static_cast<int>(K_BUCKET_SIZE) - static_cast<int>(bucket_size);
-            int slots_blocked_by_pings = static_cast<int>(pending_count);
-            int free_slots_needed = static_cast<int>(ALPHA);
-            int max_slots_by_ping = static_cast<int>(K_BUCKET_SIZE);
-            
-            // If we don't have enough free slots after accounting for pending pings
-            if (available_slots == 0 && max_slots_by_ping - slots_blocked_by_pings < free_slots_needed) {
-                // Calculate how many pings to remove to free up ALPHA slots
-                int pings_to_remove = free_slots_needed - (max_slots_by_ping - slots_blocked_by_pings);
-                pings_to_remove = (std::min)(pings_to_remove, static_cast<int>(pending_count));
-                pings_to_remove = (std::max)(pings_to_remove, 0);
-
-                if (pings_to_remove > 0) {
-                    LOG_DHT_DEBUG("Bucket " << bucket_idx << " is overfilled with ping requests: "
-                                 << "size=" << bucket_size << "/" << K_BUCKET_SIZE 
-                                 << ", pending_pings=" << pending_count
-                                 << ", available_slots=" << available_slots
-                                 << " - clearing " << pings_to_remove << " oldest ping verifications to free " << free_slots_needed << " slots");
-                    
-                    // Sort pings by age (oldest first) and remove the oldest ones
-                    std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> sorted_pings;
-                    sorted_pings.reserve(ping_trans_ids.size());
-                    for (const auto& trans_id : ping_trans_ids) {
-                        auto ping_it = pending_pings_.find(trans_id);
-                        if (ping_it != pending_pings_.end()) {
-                            sorted_pings.push_back({trans_id, ping_it->second.ping_sent_at});
-                        }
-                    }
-                    
-                    std::sort(sorted_pings.begin(), sorted_pings.end(),
-                             [](const auto& a, const auto& b) {
-                                 return a.second < b.second; // oldest first
-                             });
-                    
-                    // Remove the oldest pings
-                    for (int i = 0; i < pings_to_remove && i < static_cast<int>(sorted_pings.size()); ++i) {
-                        const auto& trans_id = sorted_pings[i].first;
-                        auto ping_it = pending_pings_.find(trans_id);
-                        if (ping_it != pending_pings_.end()) {
-                            auto age_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now() - ping_it->second.ping_sent_at
-                            ).count();
-                            LOG_DHT_DEBUG("  Clearing ping from bucket " 
-                                          << ping_it->second.bucket_index << ": transaction=" << trans_id 
-                                          << ", age=" << age_seconds << "s");
-                            
-                            // Clean up transaction mapping (already holding search_lock)
-                            transaction_to_search_.erase(trans_id);
-                            
-                            // Clean up tracking sets (already holding nodes_lock)
-                            nodes_being_replaced_.erase(ping_it->second.old_node.id);
-                            candidates_being_pinged_.erase(ping_it->second.candidate_node.id);
-                            
-                            // Clean up pending ping (already holding ping_lock)
-                            pending_pings_.erase(ping_it);
-                            total_cleared++;
-                        }
-                    }
-                }
-            }
-        }
+        auto insert_result = pending_searches_.emplace(hash_key, std::move(new_search));
+        PendingSearch& search_ref = insert_result.first->second;
         
-        if (total_cleared > 0) {
-            LOG_DHT_INFO("Cleared " << total_cleared << " pending ping verifications from overfilled buckets before peer search");
-        } else {
-            LOG_DHT_DEBUG("No overfilled buckets found - all buckets have sufficient free slots for peer search");
-        }
-    } // Release all locks here
-    
-    // Re-acquire pending_searches_mutex_ to create the new search
-    std::lock_guard<std::mutex> lock(pending_searches_mutex_);
-    
-    // Create new search
-    PendingSearch new_search(info_hash, iteration_max);
-    new_search.callbacks.push_back(callback);
-    auto insert_result = pending_searches_.emplace(hash_key, std::move(new_search));
-    PendingSearch& search_ref = insert_result.first->second;
-    
-    // Start search by querying closest nodes
-    int alpha = (std::min)(6, (std::max)(alpha_max, (int)ALPHA));
-    auto closest_nodes = find_closest_nodes(info_hash, alpha);
-
-    if (closest_nodes.empty()) {
-        LOG_DHT_WARN("No nodes in routing table to query for info_hash " << hash_key 
-                    << " - search will retry when nodes become available");
-        return false;
+        LOG_DHT_DEBUG("Initialized search with " << search_ref.search_nodes.size() << " nodes from routing table");
+        
+        // Start sending requests
+        add_search_requests(search_ref, deferred);
     }
     
-    for (const auto& node : closest_nodes) {
-        // Generate transaction ID and track this as a pending search for KRPC
-        std::string transaction_id = KrpcProtocol::generate_transaction_id();
-        
-        transaction_to_search_[transaction_id] = hash_key;
-        search_ref.queried_nodes.insert(node_id_to_hex(node.id));
-        
-        auto message = KrpcProtocol::create_get_peers_query(transaction_id, node_id_, info_hash);
-        send_krpc_message(message, node.peer);
-    }
+    // Invoke callbacks outside the lock to avoid deadlock
+    deferred.invoke();
     
     return true;
 }
@@ -376,10 +277,16 @@ void DhtClient::maintenance_loop() {
     auto last_ping_verification_cleanup = std::chrono::steady_clock::now();
     auto last_general_cleanup = std::chrono::steady_clock::now();
     auto last_stats_print = std::chrono::steady_clock::now();
+    auto last_search_timeout_check = std::chrono::steady_clock::now();
     
     while (running_) {
         auto now = std::chrono::steady_clock::now();
 
+        // Check for timed out search requests every 2 seconds (frequent check)
+        if (now - last_search_timeout_check >= std::chrono::seconds(2)) {
+            cleanup_timed_out_search_requests();
+            last_search_timeout_check = now;
+        }
         
         // General cleanup operations every 1 minute (like previously)
         if (now - last_general_cleanup >= std::chrono::minutes(1)) {
@@ -457,7 +364,6 @@ void DhtClient::maintenance_loop() {
             size_t nodes_being_replaced = 0;
             {
                 std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
-                std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
                 pending_pings = pending_pings_.size();
                 nodes_being_replaced = nodes_being_replaced_.size();
             }
@@ -486,10 +392,10 @@ void DhtClient::maintenance_loop() {
             last_stats_print = now;
         }
         
-        // Execute maintenance loop every 5 seconds
+        // Execute maintenance loop every 1 second
         {
             std::unique_lock<std::mutex> lock(shutdown_mutex_);
-            if (shutdown_cv_.wait_for(lock, std::chrono::seconds(5), [this] { return !running_.load(); })) {
+            if (shutdown_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return !running_.load(); })) {
                 break;
             }
         }
@@ -501,26 +407,22 @@ void DhtClient::maintenance_loop() {
 void DhtClient::handle_message(const std::vector<uint8_t>& data, const Peer& sender) {
     LOG_DHT_DEBUG("Processing message of " << data.size() << " bytes from " << sender.ip << ":" << sender.port);
     
-    LOG_DHT_DEBUG("Using BitTorrent DHT (KRPC) protocol from " << sender.ip << ":" << sender.port);
-
-        // Handle KRPC message
-        auto krpc_message = KrpcProtocol::decode_message(data);
-        if (!krpc_message) {
-            LOG_DHT_WARN("Failed to decode KRPC message from " << sender.ip << ":" << sender.port);
-            return;
-        }
-        
-        handle_krpc_message(*krpc_message, sender);
+    auto krpc_message = KrpcProtocol::decode_message(data);
+    if (!krpc_message) {
+        LOG_DHT_WARN("Failed to decode KRPC message from " << sender.ip << ":" << sender.port);
+        return;
+    }
+    
+    handle_krpc_message(*krpc_message, sender);
 }
 
-void DhtClient::add_node(const DhtNode& node, std::string transaction_id, bool verify) {
-    bool node_was_added = false;
+void DhtClient::add_node(const DhtNode& node, bool verify) {
     bool should_initiate_ping = false;
     DhtNode worst_node_copy;
     int bucket_index_copy = 0;
     
     {
-        std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
+        std::lock_guard<std::mutex> pings_lock(pending_pings_mutex_);
         std::lock_guard<std::mutex> lock(routing_table_mutex_);
         
         int bucket_index = get_bucket_index(node.id);
@@ -539,13 +441,11 @@ void DhtClient::add_node(const DhtNode& node, std::string transaction_id, bool v
             LOG_DHT_DEBUG("Node " << node_id_to_hex(node.id) << " already exists in bucket " << bucket_index << ", updating");
             it->peer = node.peer;
             it->last_seen = std::chrono::steady_clock::now();
-            node_was_added = true;
         } else {
             // Add new node
             if (bucket.size() < K_BUCKET_SIZE) {
                 bucket.push_back(node);
                 LOG_DHT_DEBUG("Added new node " << node_id_to_hex(node.id) << " to bucket " << bucket_index << " (size: " << bucket.size() << "/" << K_BUCKET_SIZE << ")");
-                node_was_added = true;
             } else {
                 // Bucket is full
                 if (!verify) {
@@ -560,18 +460,15 @@ void DhtClient::add_node(const DhtNode& node, std::string transaction_id, bool v
                                   << " (verify=false)");
                     
                     *worst_it = node;
-                    node_was_added = true;
                 } else {
                     // Bucket is full, use ping-before-replace eviction (BEP 5)
                     
                     // Find the worst node that's not already being pinged for replacement
                     auto worst_it = bucket.end();
-                    {
-                        for (auto it = bucket.begin(); it != bucket.end(); ++it) {
-                            if (nodes_being_replaced_.find(it->id) == nodes_being_replaced_.end()) {
-                                if (worst_it == bucket.end() || it->last_seen < worst_it->last_seen) {
-                                    worst_it = it;
-                                }
+                    for (auto it = bucket.begin(); it != bucket.end(); ++it) {
+                        if (nodes_being_replaced_.find(it->id) == nodes_being_replaced_.end()) {
+                            if (worst_it == bucket.end() || it->last_seen < worst_it->last_seen) {
+                                worst_it = it;
                             }
                         }
                     }
@@ -595,51 +492,9 @@ void DhtClient::add_node(const DhtNode& node, std::string transaction_id, bool v
         }
     } // Release routing_table_mutex_ here
     
-    // Call on_node_added() outside the routing_table_mutex_ to avoid deadlock
-    if (node_was_added) {
-        on_node_added(node, transaction_id);
-    }
-    
     // Initiate ping verification outside the routing_table_mutex_ to avoid deadlock
     if (should_initiate_ping) {
-        initiate_ping_verification(node, worst_node_copy, bucket_index_copy, transaction_id);
-    }
-}
-
-void DhtClient::on_node_added(const DhtNode& node, std::string transaction_id) {
-    LOG_DHT_DEBUG("Node " << node_id_to_hex(node.id) << " added to routing table (transaction: " << transaction_id << ")");
-    
-    // Don't check for pending searches if transaction_id is empty
-    if (transaction_id.empty()) {
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(pending_searches_mutex_);
-    auto trans_it = transaction_to_search_.find(transaction_id);
-    if (trans_it != transaction_to_search_.end()) {
-        std::string hash_key = trans_it->second;
-        auto search_it = pending_searches_.find(hash_key);
-        if (search_it != pending_searches_.end()) {
-            auto& pending_search = search_it->second;
-            
-            // Skip if already finished (don't continue iterating a finished search)
-            if (pending_search.is_finished) {
-                LOG_DHT_DEBUG("Node " << node_id_to_hex(node.id) << " is relevant to pending search for info_hash " << hash_key 
-                              << " but search is already finished - skipping");
-                return;
-            }
-            
-            LOG_DHT_DEBUG("Node " << node_id_to_hex(node.id) << " is relevant to pending search for info_hash " << hash_key 
-                          << " - continuing search iteration");
-
-            // Continue search iteration since we now have a new node in the routing table
-            // Don't remove the search here - it will be cleaned up in handle_krpc_response() 
-            // after all response data (nodes AND peers) is fully processed
-            continue_search_iteration(pending_search);
-        }
-        
-        // DON'T remove the transaction mapping here - it will be removed when the response is fully processed
-        // This allows multiple nodes from the same response to all trigger search iterations if needed
+        initiate_ping_verification(node, worst_node_copy, bucket_index_copy);
     }
 }
 
@@ -814,7 +669,7 @@ void DhtClient::handle_krpc_ping(const KrpcMessage& message, const Peer& sender)
     // Add sender to routing table (no verification needed - they contacted us)
     KrpcNode krpc_node(message.sender_id, sender.ip, sender.port);
     DhtNode sender_node = krpc_node_to_dht_node(krpc_node);
-    add_node(sender_node, "", false);
+    add_node(sender_node, false);
     
     // Respond with ping response
     auto response = KrpcProtocol::create_ping_response(message.transaction_id, node_id_);
@@ -827,7 +682,7 @@ void DhtClient::handle_krpc_find_node(const KrpcMessage& message, const Peer& se
     // Add sender to routing table (no verification needed - they contacted us)
     KrpcNode krpc_node(message.sender_id, sender.ip, sender.port);
     DhtNode sender_node = krpc_node_to_dht_node(krpc_node);
-    add_node(sender_node, "", false);
+    add_node(sender_node, false);
     
     // Find closest nodes
     auto closest_nodes = find_closest_nodes(message.target_id, K_BUCKET_SIZE);
@@ -844,7 +699,7 @@ void DhtClient::handle_krpc_get_peers(const KrpcMessage& message, const Peer& se
     // Add sender to routing table (no verification needed - they contacted us)
     KrpcNode krpc_node(message.sender_id, sender.ip, sender.port);
     DhtNode sender_node = krpc_node_to_dht_node(krpc_node);
-    add_node(sender_node, "", false);
+    add_node(sender_node, false);
     
     // Generate a token for this peer
     std::string token = generate_token(sender);
@@ -882,7 +737,7 @@ void DhtClient::handle_krpc_announce_peer(const KrpcMessage& message, const Peer
     // Add sender to routing table (no verification needed - they contacted us)
     KrpcNode krpc_node(message.sender_id, sender.ip, sender.port);
     DhtNode sender_node = krpc_node_to_dht_node(krpc_node);
-    add_node(sender_node, "", false);
+    add_node(sender_node, false);
     
     // Store the peer announcement
     Peer announcing_peer(sender.ip, message.port);
@@ -902,12 +757,12 @@ void DhtClient::handle_krpc_response(const KrpcMessage& message, const Peer& sen
     // Add responder to routing table (no verification needed - they responded to us)
     KrpcNode krpc_node(message.response_id, sender.ip, sender.port);
     DhtNode sender_node = krpc_node_to_dht_node(krpc_node);
-    add_node(sender_node, message.transaction_id, false);
+    add_node(sender_node, false);
     
     // Add any nodes from the response (these need verification - we haven't contacted them)
     for (const auto& node : message.nodes) {
         DhtNode dht_node = krpc_node_to_dht_node(node);
-        add_node(dht_node, message.transaction_id, true);
+        add_node(dht_node, true);
     }
     
     // Check if this is a response to a pending search (get_peers with peers)
@@ -917,6 +772,11 @@ void DhtClient::handle_krpc_response(const KrpcMessage& message, const Peer& sen
     // Check if this is a response to a pending search (get_peers with nodes)
     else if (!message.nodes.empty()) {
         handle_get_peers_response_with_nodes(message.transaction_id, sender, message.nodes);
+    }
+    else {
+        // Empty response (no peers, no nodes) - still need to mark as responded
+        // This can happen when a node has no information about the info_hash
+        handle_get_peers_empty_response(message.transaction_id, sender);
     }
     
     // Check if this is a response to a pending announce (get_peers with token)
@@ -930,7 +790,7 @@ void DhtClient::handle_krpc_response(const KrpcMessage& message, const Peer& sen
         std::lock_guard<std::mutex> lock(pending_searches_mutex_);
         auto trans_it = transaction_to_search_.find(message.transaction_id);
         if (trans_it != transaction_to_search_.end()) {
-            std::string hash_key = trans_it->second;
+            const std::string& hash_key = trans_it->second.info_hash_hex;
             auto search_it = pending_searches_.find(hash_key);
             if (search_it != pending_searches_.end() && search_it->second.is_finished) {
                 LOG_DHT_DEBUG("Cleaning up finished search for info_hash " << hash_key 
@@ -991,27 +851,6 @@ void DhtClient::send_krpc_announce_peer(const Peer& peer, const InfoHash& info_h
     std::string transaction_id = KrpcProtocol::generate_transaction_id();
     auto message = KrpcProtocol::create_announce_peer_query(transaction_id, node_id_, info_hash, port, token);
     send_krpc_message(message, peer);
-}
-
-// KRPC protocol sending functions
-void DhtClient::send_ping(const Peer& peer) {
-        LOG_DHT_DEBUG("Sending KRPC PING to " << peer.ip << ":" << peer.port);
-        send_krpc_ping(peer);
-}
-
-void DhtClient::send_find_node(const Peer& peer, const NodeId& target) {
-        LOG_DHT_DEBUG("Sending KRPC FIND_NODE to " << peer.ip << ":" << peer.port);
-        send_krpc_find_node(peer, target);
-}
-
-void DhtClient::send_get_peers(const Peer& peer, const InfoHash& info_hash) {
-        LOG_DHT_DEBUG("Sending KRPC GET_PEERS to " << peer.ip << ":" << peer.port);
-        send_krpc_get_peers(peer, info_hash);
-}
-
-void DhtClient::send_announce_peer(const Peer& peer, const InfoHash& info_hash, uint16_t port, const std::string& token) {
-        LOG_DHT_DEBUG("Sending KRPC ANNOUNCE_PEER to " << peer.ip << ":" << peer.port);
-        send_krpc_announce_peer(peer, info_hash, port, token);
 }
 
 // Conversion utilities
@@ -1182,7 +1021,7 @@ void DhtClient::refresh_buckets() {
                 // Find nodes to query
                 auto closest_nodes = find_closest_nodes_unlocked(random_id, ALPHA);
                 for (const auto& node : closest_nodes) {
-                    send_find_node(node.peer, random_id);
+                    send_krpc_find_node(node.peer, random_id);
                 }
             }
         }
@@ -1226,12 +1065,186 @@ void DhtClient::cleanup_stale_searches() {
     // Clean up stale transaction mappings (remove ones that point to non-existent searches)
     auto trans_it = transaction_to_search_.begin();
     while (trans_it != transaction_to_search_.end()) {
-        if (pending_searches_.find(trans_it->second) == pending_searches_.end()) {
-            LOG_DHT_DEBUG("Removing stale transaction mapping " << trans_it->first << " -> " << trans_it->second);
+        if (pending_searches_.find(trans_it->second.info_hash_hex) == pending_searches_.end()) {
+            LOG_DHT_DEBUG("Removing stale transaction mapping " << trans_it->first << " -> " << trans_it->second.info_hash_hex);
             trans_it = transaction_to_search_.erase(trans_it);
         } else {
             ++trans_it;
         }
+    }
+}
+
+void DhtClient::cleanup_timed_out_search_requests() {
+    std::vector<DeferredCallbacks> all_deferred;
+    
+    {
+        std::lock_guard<std::mutex> lock(pending_searches_mutex_);
+
+        if (pending_searches_.empty()) {
+            return;
+        }
+        
+        auto now = std::chrono::steady_clock::now();
+        // - Short timeout (2s): Free up the slot by increasing branch_factor, but keep waiting for late response
+        // - Full timeout (15s): Mark node as failed and remove the transaction
+        auto short_timeout_threshold = std::chrono::seconds(2);
+        auto full_timeout_threshold = std::chrono::seconds(15);
+        
+        // Collect transactions that need short timeout or full timeout
+        std::vector<std::string> short_timeout_transactions;
+        std::vector<std::string> full_timeout_transactions;
+        
+        for (const auto& [transaction_id, trans_info] : transaction_to_search_) {
+            auto elapsed = now - trans_info.sent_at;
+            
+            if (elapsed > full_timeout_threshold) {
+                full_timeout_transactions.push_back(transaction_id);
+            } else if (elapsed > short_timeout_threshold) {
+                // Check if this node already has short timeout
+                auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+                if (search_it != pending_searches_.end()) {
+                    auto& search = search_it->second;
+                    // Only process if not already marked with short timeout
+                    auto state_it = search.node_states.find(trans_info.queried_node_id);
+                    if (state_it == search.node_states.end() || !(state_it->second & SearchNodeFlags::SHORT_TIMEOUT)) {
+                        short_timeout_transactions.push_back(transaction_id);
+                    }
+                }
+            }
+        }
+        
+        // Group by search to batch process and call add_search_requests once per search
+        std::unordered_set<std::string> affected_searches;
+        
+        // Process short timeouts first - these nodes are slow but we still wait for a response
+        for (const auto& transaction_id : short_timeout_transactions) {
+            auto trans_it = transaction_to_search_.find(transaction_id);
+            if (trans_it == transaction_to_search_.end()) {
+                continue;
+            }
+            
+            const auto& trans_info = trans_it->second;
+            auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+            
+            if (search_it != pending_searches_.end()) {
+                auto& search = search_it->second;
+                
+                if (!search.is_finished) {
+                    // Check if this node was abandoned during truncation
+                    auto state_it = search.node_states.find(trans_info.queried_node_id);
+                    if (state_it != search.node_states.end() && 
+                        (state_it->second & SearchNodeFlags::ABANDONED)) {
+                        // Node was abandoned, skip short timeout processing
+                        continue;
+                    }
+                    
+                    // Mark node with short timeout (add flag, preserving existing flags)
+                    search.node_states[trans_info.queried_node_id] |= SearchNodeFlags::SHORT_TIMEOUT;
+                    
+                    // Increase branch factor to allow another request (opening up a slot)
+                    search.branch_factor++;
+                    
+                    LOG_DHT_DEBUG("Short timeout for node " << node_id_to_hex(trans_info.queried_node_id) 
+                                  << " in search " << trans_info.info_hash_hex 
+                                  << " - increased branch_factor to " << search.branch_factor
+                                  << " (still waiting for late response)");
+                    
+                    affected_searches.insert(trans_info.info_hash_hex);
+                }
+            }
+            // Note: We DON'T remove the transaction - we're still waiting for a possible late response
+        }
+        
+        // Process full timeouts - these nodes have completely failed
+        for (const auto& transaction_id : full_timeout_transactions) {
+            auto trans_it = transaction_to_search_.find(transaction_id);
+            if (trans_it == transaction_to_search_.end()) {
+                continue;
+            }
+            
+            const auto& trans_info = trans_it->second;
+            auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+            
+            if (search_it != pending_searches_.end()) {
+                auto& search = search_it->second;
+                
+                if (!search.is_finished) {
+                    // Get current flags for this node
+                    uint8_t& flags = search.node_states[trans_info.queried_node_id];
+                    
+                    // Check if this node was abandoned during truncation
+                    if (flags & SearchNodeFlags::ABANDONED) {
+                        // Node was abandoned, invoke_count already decremented
+                        // Just remove the transaction and continue
+                        transaction_to_search_.erase(trans_it);
+                        continue;
+                    }
+                    
+                    bool had_short_timeout = flags & SearchNodeFlags::SHORT_TIMEOUT;
+                    
+                    // Always decrement invoke_count on full timeout (node was still in-flight)
+                    if (search.invoke_count > 0) {
+                        search.invoke_count--;
+                    }
+                    
+                    if (had_short_timeout) {
+                        // Restore branch factor since node fully timed out
+                        if (search.branch_factor > static_cast<int>(ALPHA)) {
+                            search.branch_factor--;
+                        }
+                        
+                        LOG_DHT_DEBUG("Full timeout for node " << node_id_to_hex(trans_info.queried_node_id) 
+                                      << " in search " << trans_info.info_hash_hex 
+                                      << " (had short timeout) - restored branch_factor to " << search.branch_factor
+                                      << ", invoke_count now: " << search.invoke_count);
+                    } else {
+                        LOG_DHT_DEBUG("Full timeout for node " << node_id_to_hex(trans_info.queried_node_id) 
+                                      << " in search " << trans_info.info_hash_hex 
+                                      << " - invoke_count now: " << search.invoke_count);
+                    }
+                    
+                    // Mark the node as timed out (add flag, preserving history)
+                    flags |= SearchNodeFlags::TIMED_OUT;
+                    
+                    affected_searches.insert(trans_info.info_hash_hex);
+                }
+            }
+            
+            // Remove the fully timed out transaction
+            transaction_to_search_.erase(trans_it);
+        }
+        
+        if (!short_timeout_transactions.empty() || !full_timeout_transactions.empty()) {
+            LOG_DHT_DEBUG("Timeout handling: " << short_timeout_transactions.size() << " short timeouts, "
+                          << full_timeout_transactions.size() << " full timeouts");
+        }
+        
+        // Continue searches that had timeout events
+        for (const auto& hash_key : affected_searches) {
+            auto search_it = pending_searches_.find(hash_key);
+            if (search_it != pending_searches_.end() && !search_it->second.is_finished) {
+                LOG_DHT_DEBUG("Continuing search " << hash_key << " after timeout handling");
+                DeferredCallbacks deferred;
+                add_search_requests(search_it->second, deferred);
+                if (deferred.should_invoke) {
+                    all_deferred.push_back(std::move(deferred));
+                }
+            }
+        }
+        
+        // Clean up finished searches
+        for (const auto& hash_key : affected_searches) {
+            auto search_it = pending_searches_.find(hash_key);
+            if (search_it != pending_searches_.end() && search_it->second.is_finished) {
+                LOG_DHT_DEBUG("Removing finished search " << hash_key << " after timeout handling");
+                pending_searches_.erase(search_it);
+            }
+        }
+    }
+    
+    // Invoke all deferred callbacks outside the lock to avoid deadlock
+    for (auto& deferred : all_deferred) {
+        deferred.invoke();
     }
 }
 
@@ -1245,185 +1258,430 @@ void DhtClient::handle_get_peers_response_for_announce(const std::string& transa
                       << " - sending announce_peer for info_hash " << node_id_to_hex(pending_announce.info_hash) 
                       << " to " << responder.ip << ":" << responder.port);
         
-        // Send announce_peer with the received token using unified function
-        send_announce_peer(responder, pending_announce.info_hash, pending_announce.port, token);
+        // Send announce_peer with the received token
+        send_krpc_announce_peer(responder, pending_announce.info_hash, pending_announce.port, token);
         
         // Remove the pending announce since we've handled it
         pending_announces_.erase(it);
     }
 }
 
+void DhtClient::handle_get_peers_empty_response(const std::string& transaction_id, const Peer& responder) {
+    DeferredCallbacks deferred;
+    {
+        std::lock_guard<std::mutex> lock(pending_searches_mutex_);
+        auto trans_it = transaction_to_search_.find(transaction_id);
+        if (trans_it != transaction_to_search_.end()) {
+            const auto& trans_info = trans_it->second;
+            auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+            if (search_it != pending_searches_.end()) {
+                auto& pending_search = search_it->second;
 
-void DhtClient::handle_get_peers_response_for_search(const std::string& transaction_id, const Peer& responder, const std::vector<Peer>& peers) {
-    std::lock_guard<std::mutex> lock(pending_searches_mutex_);
-    
-    auto trans_it = transaction_to_search_.find(transaction_id);
-    if (trans_it != transaction_to_search_.end()) {
-        std::string hash_key = trans_it->second;
-        auto search_it = pending_searches_.find(hash_key);
-        if (search_it != pending_searches_.end()) {
-            auto& pending_search = search_it->second;
-            LOG_DHT_DEBUG("Found pending search for KRPC transaction " << transaction_id 
-                          << " - received " << peers.size() << " peers for info_hash " << hash_key 
-                          << " from " << responder.ip << ":" << responder.port);
+                // Check if this node was abandoned during truncation
+                auto state_it = pending_search.node_states.find(trans_info.queried_node_id);
+                if (state_it != pending_search.node_states.end() && 
+                    (state_it->second & SearchNodeFlags::ABANDONED)) {
+                    LOG_DHT_DEBUG("Ignoring empty response from abandoned node " 
+                                  << node_id_to_hex(trans_info.queried_node_id));
+                    return;
+                }
 
-            // Log each found peer with indentation
-            for (size_t i = 0; i < peers.size(); ++i) {
-                LOG_DHT_DEBUG("  [" << i << "] found peer for hash(" << hash_key << ") = " << peers[i].ip << ":" << peers[i].port);
-            }
-            
-            if (!peers.empty()) {
-                // We found actual peers - invoke all callbacks and mark search as finished
-                auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - pending_search.created_at
-                ).count();
+                uint8_t& flags = pending_search.node_states[trans_info.queried_node_id];
+
+                if (flags & SearchNodeFlags::RESPONDED) {
+                    LOG_DHT_DEBUG("Ignoring duplicate response from node " << node_id_to_hex(trans_info.queried_node_id));
+                    return;
+                }
                 
-                LOG_DHT_INFO("=== Search Completed for info_hash " << hash_key << " ===");
-                LOG_DHT_INFO("  Duration: " << duration_ms << "ms");
-                LOG_DHT_INFO("  Peers found: " << peers.size());
-                LOG_DHT_INFO("  Total nodes queried: " << pending_search.queried_nodes.size());
-                LOG_DHT_INFO("  Iterations completed: " << pending_search.iteration_count << "/" 
-                             << (pending_search.iteration_max == 0 ? "infinity" : std::to_string(pending_search.iteration_max)));
-                LOG_DHT_INFO("  Callbacks to invoke: " << pending_search.callbacks.size());
+                // Decrement invoke count
+                if (pending_search.invoke_count > 0) {
+                    pending_search.invoke_count--;
+                }
                 
-                for (const auto& callback : pending_search.callbacks) {
-                    if (callback) {
-                        callback(peers, pending_search.info_hash);
+                // Restore branch_factor if had short timeout
+                if (flags & SearchNodeFlags::SHORT_TIMEOUT) {
+                    if (pending_search.branch_factor > static_cast<int>(ALPHA)) {
+                        pending_search.branch_factor--;
                     }
                 }
                 
-                // Mark the search as finished (will be cleaned up at end of handle_krpc_response)
-                pending_search.is_finished = true;
+                // Mark as responded
+                flags |= SearchNodeFlags::RESPONDED;
+                
+                LOG_DHT_DEBUG("Empty get_peers response from " << responder.ip << ":" << responder.port
+                              << " for info_hash " << trans_info.info_hash_hex
+                              << " (invoke_count now: " << pending_search.invoke_count << ")");
+                
+                // Continue search
+                add_search_requests(pending_search, deferred);
             }
         }
-        
-        // DON'T remove the transaction mapping here - it will be removed at the end of handle_krpc_response
-        // This ensures all response data is fully processed before cleanup
     }
+    
+    deferred.invoke();
+}
+
+void DhtClient::handle_get_peers_response_for_search(const std::string& transaction_id, const Peer& responder, const std::vector<Peer>& peers) {
+    DeferredCallbacks deferred_immediate;   // For new peers callbacks
+    DeferredCallbacks deferred_completion;  // For search completion callbacks
+
+    {
+        std::lock_guard<std::mutex> lock(pending_searches_mutex_);
+        auto trans_it = transaction_to_search_.find(transaction_id);
+        if (trans_it != transaction_to_search_.end()) {
+            const auto& trans_info = trans_it->second;
+            auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+            if (search_it != pending_searches_.end()) {
+                auto& pending_search = search_it->second;
+
+                // Check if this node was abandoned during truncation
+                auto state_it = pending_search.node_states.find(trans_info.queried_node_id);
+                if (state_it != pending_search.node_states.end() && 
+                    (state_it->second & SearchNodeFlags::ABANDONED)) {
+                    LOG_DHT_DEBUG("Ignoring response from abandoned node " 
+                                << node_id_to_hex(trans_info.queried_node_id)
+                                << " - invoke_count already decremented during truncation");
+                    return;
+                }
+
+                // Get flags for this node and mark as responded
+                uint8_t& flags = pending_search.node_states[trans_info.queried_node_id];
+
+                // Check if already responded (duplicate response)
+                if (flags & SearchNodeFlags::RESPONDED) {
+                    LOG_DHT_DEBUG("Ignoring duplicate response from node " 
+                                << node_id_to_hex(trans_info.queried_node_id));
+                    return;
+                }
+                
+                // Decrement invoke count since we received a response
+                if (pending_search.invoke_count > 0) {
+                    pending_search.invoke_count--;
+                }
+                
+                // If this node had short timeout, restore the branch factor (late response arrived)
+                if (flags & SearchNodeFlags::SHORT_TIMEOUT) {
+                    if (pending_search.branch_factor > static_cast<int>(ALPHA)) {
+                        pending_search.branch_factor--;
+                    }
+                    LOG_DHT_DEBUG("Late response from node " << node_id_to_hex(trans_info.queried_node_id)
+                                << " (had short timeout) - restored branch_factor to " << pending_search.branch_factor);
+                }
+                
+                // Mark as responded (add flag, preserving history including SHORT_TIMEOUT)
+                flags |= SearchNodeFlags::RESPONDED;
+                
+                LOG_DHT_DEBUG("Found pending search for KRPC transaction " << transaction_id 
+                            << " - received " << peers.size() << " peers for info_hash " << trans_info.info_hash_hex 
+                            << " from " << responder.ip << ":" << responder.port
+                            << " (invoke_count now: " << pending_search.invoke_count << ")");
+
+                // Accumulate peers (with deduplication) - continue search like reference implementation
+                if (!peers.empty()) {
+                    // Collect only new (non-duplicate) peers for immediate callback
+                    std::vector<Peer> new_peers;
+                    new_peers.reserve(peers.size());
+                    
+                    for (const auto& peer : peers) {
+                        // Check if peer already exists in found_peers
+                        auto it = std::find_if(pending_search.found_peers.begin(), 
+                                            pending_search.found_peers.end(),
+                                            [&peer](const Peer& p) { 
+                                                return p.ip == peer.ip && p.port == peer.port; 
+                                            });
+                        if (it == pending_search.found_peers.end()) {
+                            pending_search.found_peers.push_back(peer);
+                            new_peers.push_back(peer);
+                            LOG_DHT_DEBUG("  [new] found peer for hash(" << trans_info.info_hash_hex << ") = " << peer.ip << ":" << peer.port);
+                        }
+                    }
+                    
+                    // Collect immediate callbacks for new peers
+                    if (!new_peers.empty()) {
+                        LOG_DHT_DEBUG("Invoking " << pending_search.callbacks.size() << " callbacks with " 
+                                    << new_peers.size() << " new peers for info_hash " << trans_info.info_hash_hex);
+                        deferred_immediate.should_invoke = true;
+                        deferred_immediate.peers = std::move(new_peers);
+                        deferred_immediate.info_hash = pending_search.info_hash;
+                        deferred_immediate.callbacks = pending_search.callbacks;
+                    }
+                    
+                    LOG_DHT_DEBUG("Accumulated " << pending_search.found_peers.size() << " total peers for info_hash " << trans_info.info_hash_hex);
+                }
+                
+                // Continue search - let add_search_requests determine when to finish
+                add_search_requests(pending_search, deferred_completion);
+            }
+            
+            // DON'T remove the transaction mapping here - it will be removed at the end of handle_krpc_response
+            // This ensures all response data is fully processed before cleanup
+        }
+    }
+
+    // Invoke all callbacks outside the lock to avoid deadlock
+    deferred_immediate.invoke();
+    deferred_completion.invoke();
 }
 
 
 void DhtClient::handle_get_peers_response_with_nodes(const std::string& transaction_id, const Peer& responder, const std::vector<KrpcNode>& nodes) {
     // This function is called when get_peers returns nodes instead of peers
-    // The nodes have already been added to the routing table in handle_krpc_response()
-    // and on_node_added() was called for each, which may have triggered search iterations
+    // Add the new nodes to search_nodes and continue the search
     
-    std::lock_guard<std::mutex> lock(pending_searches_mutex_);
+    DeferredCallbacks deferred;
     
-    auto trans_it = transaction_to_search_.find(transaction_id);
-    if (trans_it != transaction_to_search_.end()) {
-        std::string hash_key = trans_it->second;
-        LOG_DHT_DEBUG("Completed processing get_peers response with " << nodes.size() 
-                      << " nodes for info_hash " << hash_key << " from " << responder.ip << ":" << responder.port);
+    {
+        std::lock_guard<std::mutex> lock(pending_searches_mutex_);
         
-        // DON'T remove the transaction mapping here - it will be removed at the end of handle_krpc_response
-        // This ensures all response data is fully processed before cleanup
+        auto trans_it = transaction_to_search_.find(transaction_id);
+        if (trans_it != transaction_to_search_.end()) {
+            const auto& trans_info = trans_it->second;
+            auto search_it = pending_searches_.find(trans_info.info_hash_hex);
+            if (search_it != pending_searches_.end()) {
+                auto& pending_search = search_it->second;
+
+                // Check if this node was abandoned during truncation
+                auto state_it = pending_search.node_states.find(trans_info.queried_node_id);
+                if (state_it != pending_search.node_states.end() && 
+                    (state_it->second & SearchNodeFlags::ABANDONED)) {
+                    LOG_DHT_DEBUG("Ignoring response from abandoned node " 
+                                  << node_id_to_hex(trans_info.queried_node_id)
+                                  << " - invoke_count already decremented during truncation");
+                    return;
+                }
+
+                // Get flags for this node and mark as responded
+                uint8_t& flags = pending_search.node_states[trans_info.queried_node_id];
+
+                // Check if already responded (duplicate response)
+                if (flags & SearchNodeFlags::RESPONDED) {
+                    LOG_DHT_DEBUG("Ignoring duplicate response from node " 
+                                << node_id_to_hex(trans_info.queried_node_id));
+                    return;
+                }
+                
+                // Decrement invoke count since we received a response
+                if (pending_search.invoke_count > 0) {
+                    pending_search.invoke_count--;
+                }
+                
+                // If this node had short timeout, restore the branch factor (late response arrived)
+                if (flags & SearchNodeFlags::SHORT_TIMEOUT) {
+                    if (pending_search.branch_factor > static_cast<int>(ALPHA)) {
+                        pending_search.branch_factor--;
+                    }
+                    LOG_DHT_DEBUG("Late response from node " << node_id_to_hex(trans_info.queried_node_id)
+                                  << " (had short timeout) - restored branch_factor to " << pending_search.branch_factor);
+                }
+                
+                // Mark as responded (add flag, preserving history including SHORT_TIMEOUT)
+                flags |= SearchNodeFlags::RESPONDED;
+                
+                LOG_DHT_DEBUG("Processing get_peers response with " << nodes.size() 
+                              << " nodes for info_hash " << trans_info.info_hash_hex << " from " << responder.ip << ":" << responder.port
+                              << " (invoke_count now: " << pending_search.invoke_count << ")");
+                
+                // Add new nodes to search_nodes (sorted by distance)
+                size_t nodes_added = 0;
+                for (const auto& node : nodes) {
+                    DhtNode dht_node = krpc_node_to_dht_node(node);
+                    size_t old_size = pending_search.search_nodes.size();
+                    add_node_to_search(pending_search, dht_node);
+                    if (pending_search.search_nodes.size() > old_size) {
+                        nodes_added++;
+                    }
+                }
+                
+                LOG_DHT_DEBUG("Added " << nodes_added << " new nodes to search_nodes (total: " << pending_search.search_nodes.size() << ")");
+                
+                // Continue search with new nodes
+                add_search_requests(pending_search, deferred);
+            }
+            
+            // DON'T remove the transaction mapping here - it will be removed at the end of handle_krpc_response
+            // This ensures all response data is fully processed before cleanup
+        }
     }
+    
+    // Invoke callbacks outside the lock to avoid deadlock
+    deferred.invoke();
 }
 
 
-bool DhtClient::continue_search_iteration(PendingSearch& search) {
+void DhtClient::add_node_to_search(PendingSearch& search, const DhtNode& node) {
+    // Check if node already exists in search (node is "known" if it's in node_states map)
+    if (search.node_states.find(node.id) != search.node_states.end()) {
+        LOG_DHT_DEBUG("Node " << node_id_to_hex(node.id) << " already known for search - skipping");
+        return;
+    }
+    
+    // Find insertion point to maintain sorted order (closest first)
+    auto insert_pos = std::lower_bound(search.search_nodes.begin(), search.search_nodes.end(), node,
+                                       [&search, this](const DhtNode& a, const DhtNode& b) {
+                                           return is_closer(a.id, b.id, search.info_hash);
+                                       });
+    
+    search.search_nodes.insert(insert_pos, node);
+    // Mark node as known (add to map with no flags set - will get QUERIED flag when query is sent)
+    search.node_states[node.id] = 0;
+    
+    // Limit search_nodes size to avoid unbounded growth
+    constexpr size_t MAX_SEARCH_NODES = 100;
+    if (search.search_nodes.size() > MAX_SEARCH_NODES) {
+        // Before truncating, clean up counters for in-flight queries being discarded
+        for (size_t i = MAX_SEARCH_NODES; i < search.search_nodes.size(); ++i) {
+            const auto& discarded_node = search.search_nodes[i];
+            auto state_it = search.node_states.find(discarded_node.id);
+            if (state_it != search.node_states.end()) {
+                uint8_t flags = state_it->second;
+                // If queried but not responded/failed, it's in-flight
+                if ((flags & SearchNodeFlags::QUERIED) && 
+                    !(flags & (SearchNodeFlags::RESPONDED | SearchNodeFlags::TIMED_OUT))) {
+                    // Decrement invoke_count since this request is being abandoned
+                    if (search.invoke_count > 0) {
+                        search.invoke_count--;
+                        LOG_DHT_DEBUG("Decrementing invoke_count for abandoned node " 
+                                      << node_id_to_hex(discarded_node.id) 
+                                      << " (now: " << search.invoke_count << ")");
+                    }
+                    // If it had short timeout, also restore branch factor
+                    if (flags & SearchNodeFlags::SHORT_TIMEOUT) {
+                        if (search.branch_factor > static_cast<int>(ALPHA)) {
+                            search.branch_factor--;
+                            LOG_DHT_DEBUG("Decrementing branch_factor for abandoned node with short_timeout " 
+                                          << node_id_to_hex(discarded_node.id) 
+                                          << " (now: " << search.branch_factor << ")");
+                        }
+                    }
+                }
+                // Mark as ABANDONED instead of removing - prevents double invoke_count decrement
+                // when late response arrives (response handlers check this flag)
+                state_it->second |= SearchNodeFlags::ABANDONED;
+            }
+        }
+        search.search_nodes.resize(MAX_SEARCH_NODES);
+    }
+}
+
+bool DhtClient::add_search_requests(PendingSearch& search, DeferredCallbacks& deferred) {
+    // Returns true if search is done (completed or should be finished)
+    
+    if (search.is_finished) {
+        return true;
+    }
+    
     std::string hash_key = node_id_to_hex(search.info_hash);
     
-    LOG_DHT_DEBUG("Continuing search iteration for info_hash " << hash_key 
-                  << " with " << search.queried_nodes.size() << " queried nodes, iteration " 
-                  << search.iteration_count << "/" << (search.iteration_max == 0 ? "infinity" : std::to_string(search.iteration_max)));
+    LOG_DHT_DEBUG("Adding search requests for info_hash " << hash_key);
     
-    // Stop if we've reached max iterations (iteration_max = 0 means infinite)
-    if (search.iteration_max > 0 && search.iteration_count >= search.iteration_max) {
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - search.created_at
-        ).count();
-        
-        LOG_DHT_INFO("=== Search Completed for info_hash " << hash_key << " ===");
-        LOG_DHT_INFO("  Duration: " << duration_ms << "ms");
-        LOG_DHT_INFO("  Result: Reached max iterations (no peers found)");
-        LOG_DHT_INFO("  Total nodes queried: " << search.queried_nodes.size());
-        LOG_DHT_INFO("  Iterations completed: " << search.iteration_count << "/" << search.iteration_max);
-        
-        search.is_finished = true;
-        return false;  // Return false to indicate the search should be marked finished
-    }
+    const int k = static_cast<int>(K_BUCKET_SIZE);  // Target number of results
+    int results_found = 0;       // Nodes that have responded
+    int queries_in_flight = 0;   // Requests currently in flight
+    int timed_out_count = 0;     // Nodes that timed out
+    int queries_sent = 0;        // Queries sent this round
     
-    // Get closest nodes from routing table (already sorted by distance to target)
-    std::vector<DhtNode> closest_nodes = find_closest_nodes(search.info_hash, ALPHA);
-
-    // Query up to ALPHA closest unqueried nodes
-    int nodes_queried = 0;
-    int candidates_found = 0;
-    for (const auto& node : closest_nodes) {
-        if (nodes_queried >= ALPHA) {
-            LOG_DHT_DEBUG("Reached ALPHA limit (" << ALPHA << ") for querying nodes in iteration " << (search.iteration_count + 1) << "/" << search.iteration_max);
+    // Iterate through search_nodes (sorted by distance, closest first)
+    // Important: We must continue iterating to count results even when we can't send more requests
+    for (auto& node : search.search_nodes) {
+        // Stop if we have enough completed results
+        if (results_found >= k) {
             break;
         }
+
+        // Get flags for this node (0 if not in map, meaning just "known")
+        auto state_it = search.node_states.find(node.id);
+        uint8_t flags = (state_it != search.node_states.end()) ? state_it->second : 0;
         
-        std::string node_hex = node_id_to_hex(node.id);
-        candidates_found++;
-        
-        if (search.queried_nodes.find(node_hex) == search.queried_nodes.end()) {
-            LOG_DHT_DEBUG("Querying node " << node_hex << " at " << node.peer.ip << ":" << node.peer.port 
-                          << " (protocol: BitTorrent" 
-                          << ", iteration: " << (search.iteration_count + 1) << ")");
-            
-            // Mark node as queried in the shared search object
-            search.queried_nodes.insert(node_hex);
-            
-            std::string transaction_id = KrpcProtocol::generate_transaction_id();
-            transaction_to_search_[transaction_id] = hash_key;
-            
-            auto message = KrpcProtocol::create_get_peers_query(transaction_id, node_id_, search.info_hash);
-            send_krpc_message(message, node.peer);
-            
-            nodes_queried++;
-        } else {
-            LOG_DHT_DEBUG("Skipping already queried node " << node_hex << " at " << node.peer.ip << ":" << node.peer.port);
+        // Check if this node has already responded (counts toward results)
+        if (flags & SearchNodeFlags::RESPONDED) {
+            results_found++;
+            continue;
         }
+        
+        // Skip nodes that have timed out (don't count as results or in-flight)
+        if (flags & SearchNodeFlags::TIMED_OUT) {
+            timed_out_count++;
+            continue;
+        }
+        
+        // Check if this node was already queried
+        if (flags & SearchNodeFlags::QUERIED) {
+            // Only count as in-flight if not responded yet
+            // (TIMED_OUT already handled above, RESPONDED handled above too)
+            // This case handles nodes that are QUERIED but still waiting for response
+            queries_in_flight++;
+            continue;
+        }
+        
+        // Check if we have capacity to send more requests
+        // Important: use 'continue' not 'break' to keep counting results
+        // Use adaptive branch_factor (increases on short timeout, restores on response/full timeout)
+        if (search.invoke_count >= search.branch_factor) {
+            continue;
+        }
+        
+        // Send query to this node
+        std::string transaction_id = KrpcProtocol::generate_transaction_id();
+        transaction_to_search_[transaction_id] = SearchTransaction(hash_key, node.id);
+        search.node_states[node.id] |= SearchNodeFlags::QUERIED;
+        search.invoke_count++;
+        
+        LOG_DHT_DEBUG("Querying node " << node_id_to_hex(node.id) << " at " << node.peer.ip << ":" << node.peer.port);
+        
+        auto message = KrpcProtocol::create_get_peers_query(transaction_id, node_id_, search.info_hash);
+        send_krpc_message(message, node.peer);
+        
+        queries_sent++;
     }
     
-    LOG_DHT_DEBUG("Search iteration summary for " << hash_key << ":");
-    LOG_DHT_DEBUG("  - Candidates evaluated: " << candidates_found);
-    LOG_DHT_DEBUG("  - Nodes queried: " << nodes_queried);
-    LOG_DHT_DEBUG("  - Already queried nodes skipped: " << (candidates_found - nodes_queried));
-    LOG_DHT_DEBUG("  - Total queried nodes: " << search.queried_nodes.size());
-    LOG_DHT_DEBUG("  - Current iteration: " << search.iteration_count << "/" << search.iteration_max);
+    LOG_DHT_DEBUG("Search [" << hash_key << "] progress [ms: " << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - search.created_at).count() << "]:");
+    LOG_DHT_DEBUG(" * search_nodes: " << search.search_nodes.size());
+    LOG_DHT_DEBUG(" * queries_sent: " << queries_sent);
+    LOG_DHT_DEBUG(" * invoke_count: " << search.invoke_count);
+    LOG_DHT_DEBUG(" * branch_factor: " << search.branch_factor);
+    LOG_DHT_DEBUG(" * results_found: " << results_found);
+    LOG_DHT_DEBUG(" * queries_in_flight: " << queries_in_flight);
+    LOG_DHT_DEBUG(" * timed_out: " << timed_out_count);
+    LOG_DHT_DEBUG(" * peers_found: " << search.found_peers.size());
+    LOG_DHT_DEBUG(" * callbacks: " << search.callbacks.size());
     
-    // If we queried new nodes, update the search timestamp and iteration count
-    if (nodes_queried > 0) {
-        search.updated_at = std::chrono::steady_clock::now();
-        search.iteration_count++;
-        return true;  // Continue search
-    }
-    
-    // No new nodes queried - check if search is stale
-    auto now = std::chrono::steady_clock::now();
-    auto time_since_update = std::chrono::duration_cast<std::chrono::seconds>(now - search.updated_at).count();
-    auto time_since_creation = std::chrono::duration_cast<std::chrono::seconds>(now - search.created_at).count();
-    
-    // Only terminate if the search is stale (no activity for 30 seconds)
-    // This allows time for pending responses to arrive with new nodes
-    constexpr int SEARCH_STALE_TIMEOUT = 30;  // seconds
-    
-    if (time_since_update >= SEARCH_STALE_TIMEOUT || time_since_creation >= SEARCH_STALE_TIMEOUT) {
+    if ((results_found >= k && queries_in_flight == 0) || search.invoke_count == 0) {
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - search.created_at
         ).count();
         
+        // Count final stats for completion log
+        int queried_total = 0, responded_total = 0, timed_out_total = 0, short_timeout_total = 0, abandoned_total = 0;
+        for (const auto& [id, f] : search.node_states) {
+            if (f & SearchNodeFlags::QUERIED) queried_total++;
+            if (f & SearchNodeFlags::RESPONDED) responded_total++;
+            if (f & SearchNodeFlags::TIMED_OUT) timed_out_total++;
+            if (f & SearchNodeFlags::SHORT_TIMEOUT) short_timeout_total++;
+            if (f & SearchNodeFlags::ABANDONED) abandoned_total++;
+        }
+        
         LOG_DHT_INFO("=== Search Completed for info_hash " << hash_key << " ===");
         LOG_DHT_INFO("  Duration: " << duration_ms << "ms");
-        LOG_DHT_INFO("  Result: Search stale (no peers found)");
-        LOG_DHT_INFO("  Total nodes queried: " << search.queried_nodes.size());
-        LOG_DHT_INFO("  Iterations completed: " << search.iteration_count << "/" 
-                     << (search.iteration_max == 0 ? "infinity" : std::to_string(search.iteration_max)));
-        LOG_DHT_INFO("  Stale reason: No progress for " << time_since_update << "s (total: " << time_since_creation << "s)");
+        LOG_DHT_INFO("  Total nodes queried: " << queried_total);
+        LOG_DHT_INFO("  Total nodes responded: " << responded_total);
+        LOG_DHT_INFO("  Total nodes timed out: " << timed_out_total);
+        LOG_DHT_INFO("  Nodes with short timeout: " << short_timeout_total);
+        LOG_DHT_INFO("  Nodes abandoned (truncation): " << abandoned_total);
+        LOG_DHT_INFO("  Final branch_factor: " << search.branch_factor << " (initial: " << ALPHA << ")");
+        LOG_DHT_INFO("  Total peers found: " << search.found_peers.size());
+        LOG_DHT_INFO("  Callbacks to invoke: " << search.callbacks.size());
+        
+        // Collect callbacks for deferred invocation (avoid deadlock - don't call user callbacks while holding mutex)
+        deferred.should_invoke = true;
+        deferred.callbacks = search.callbacks;
+        deferred.peers = search.found_peers;
+        deferred.info_hash = search.info_hash;
         
         search.is_finished = true;
-        return false;  // Signal to mark the search as finished
+        return true;
     }
     
-    // Search is still fresh but temporarily has no new nodes - keep it alive
-    LOG_DHT_DEBUG("Keeping search alive for " << hash_key << " - no new nodes to query yet, but search is still fresh "
-                  << "(last update: " << time_since_update << "s ago, waiting for responses)");
-    return true;  // Keep search alive
+    return false;
 }
 
 // Peer announcement storage management
@@ -1509,7 +1767,7 @@ void DhtClient::cleanup_stale_announced_peers() {
 }
 
 // Ping-before-replace eviction implementation
-void DhtClient::initiate_ping_verification(const DhtNode& candidate_node, const DhtNode& old_node, int bucket_index, std::string transaction_id) {
+void DhtClient::initiate_ping_verification(const DhtNode& candidate_node, const DhtNode& old_node, int bucket_index) {
     std::string ping_transaction_id = KrpcProtocol::generate_transaction_id();
     
     LOG_DHT_DEBUG("Initiating ping verification for candidate node " << node_id_to_hex(candidate_node.id) 
@@ -1520,7 +1778,6 @@ void DhtClient::initiate_ping_verification(const DhtNode& candidate_node, const 
     // Store ping verification state and mark old node as being replaced
     {
         std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
-        std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
 
         if (candidates_being_pinged_.find(candidate_node.id) != candidates_being_pinged_.end()) {
             LOG_DHT_DEBUG("Already pinging candidate node " << node_id_to_hex(candidate_node.id) 
@@ -1528,22 +1785,9 @@ void DhtClient::initiate_ping_verification(const DhtNode& candidate_node, const 
             return;
         }
 
-        pending_pings_.emplace(ping_transaction_id, PingVerification(candidate_node, old_node, bucket_index, ping_transaction_id));
+        pending_pings_.emplace(ping_transaction_id, PingVerification(candidate_node, old_node, bucket_index));
         nodes_being_replaced_.insert(old_node.id);
         candidates_being_pinged_.insert(candidate_node.id);
-    }
-
-    // If this node addition was part of a search, map the ping transaction to the same search
-    // so that when the ping succeeds and the node is added, we can continue the search iteration
-    if (!transaction_id.empty()) {
-        std::lock_guard<std::mutex> lock(pending_searches_mutex_);
-        auto trans_it = transaction_to_search_.find(transaction_id);
-        if (trans_it != transaction_to_search_.end()) {
-            // Map the new ping transaction to the same search
-            transaction_to_search_[ping_transaction_id] = trans_it->second;
-            LOG_DHT_DEBUG("Mapped ping transaction " << ping_transaction_id << " to search " << trans_it->second);
-            // Keep the original transaction_id mapping - it will be cleaned up when the response is fully processed
-        }
     }
     
     // Send ping to the CANDIDATE node to verify it's alive
@@ -1552,63 +1796,36 @@ void DhtClient::initiate_ping_verification(const DhtNode& candidate_node, const 
 }
 
 void DhtClient::handle_ping_verification_response(const std::string& transaction_id, const NodeId& responder_id, const Peer& responder) {
-    bool should_call_on_node_added = false;
-    DhtNode updated_candidate_copy;
-    std::string transaction_id_copy;
+    std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
     
-    {
-        std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
+    auto it = pending_pings_.find(transaction_id);
+    if (it != pending_pings_.end()) {
+        const auto& verification = it->second;
         
-        auto it = pending_pings_.find(transaction_id);
-        if (it != pending_pings_.end()) {
-            const auto& verification = it->second;
+        // Check if the responder node ID matches the candidate node we pinged
+        if (responder_id == verification.candidate_node.id) {
+            LOG_DHT_DEBUG("Ping verification successful for candidate node " << node_id_to_hex(verification.candidate_node.id) 
+                          << " - proceeding with replacement of old node " << node_id_to_hex(verification.old_node.id));
             
-            // Check if the responder node ID matches the candidate node we pinged
-            if (responder_id == verification.candidate_node.id) {
-                LOG_DHT_DEBUG("Ping verification successful for candidate node " << node_id_to_hex(verification.candidate_node.id) 
-                              << " - proceeding with replacement of old node " << node_id_to_hex(verification.old_node.id));
-                
-                // The candidate node responded and is alive - perform the replacement
-                // Create a copy of the candidate node with updated timestamp
-                DhtNode updated_candidate = verification.candidate_node;
-                updated_candidate.last_seen = std::chrono::steady_clock::now();
-                if (perform_replacement(updated_candidate, verification.old_node, verification.bucket_index)) {
-                    // Store data for calling on_node_added outside the lock
-                    should_call_on_node_added = true;
-                    updated_candidate_copy = updated_candidate;
-                    transaction_id_copy = verification.transaction_id;
-                }
-            } else {
-                LOG_DHT_WARN("Ping verification response from unexpected node " << node_id_to_hex(responder_id) 
-                             << " at " << responder.ip << ":" << responder.port 
-                             << " (expected candidate node " << node_id_to_hex(verification.candidate_node.id) << ")");
-            }
-            
-            // Remove the old node from nodes_being_replaced set
-            {
-                std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
-                nodes_being_replaced_.erase(verification.old_node.id);
-            }
-            
-            // Remove candidate from candidates_being_pinged set
-            candidates_being_pinged_.erase(verification.candidate_node.id);
-            // Remove the pending ping verification
-            pending_pings_.erase(it);
+            // The candidate node responded and is alive - perform the replacement
+            DhtNode updated_candidate = verification.candidate_node;
+            updated_candidate.last_seen = std::chrono::steady_clock::now();
+            perform_replacement(updated_candidate, verification.old_node, verification.bucket_index);
+        } else {
+            LOG_DHT_WARN("Ping verification response from unexpected node " << node_id_to_hex(responder_id) 
+                         << " at " << responder.ip << ":" << responder.port 
+                         << " (expected candidate node " << node_id_to_hex(verification.candidate_node.id) << ")");
         }
-    } // Release pending_pings_mutex_ here
-    
-    // Call on_node_added() outside the pending_pings_mutex_ to avoid deadlock
-    if (should_call_on_node_added) {
-        on_node_added(updated_candidate_copy, transaction_id_copy);
         
-        // Note: ping transaction mapping cleanup is now handled at the end of handle_krpc_response
-        // No need to manually remove it here
+        // Remove tracking entries
+        nodes_being_replaced_.erase(verification.old_node.id);
+        candidates_being_pinged_.erase(verification.candidate_node.id);
+        pending_pings_.erase(it);
     }
 }
 
 void DhtClient::cleanup_stale_ping_verifications() {
     std::lock_guard<std::mutex> ping_lock(pending_pings_mutex_);
-    std::lock_guard<std::mutex> nodes_lock(nodes_being_replaced_mutex_);
     
     auto now = std::chrono::steady_clock::now();
     auto timeout_threshold = std::chrono::seconds(30);  // 30 second timeout for ping responses
@@ -1619,17 +1836,7 @@ void DhtClient::cleanup_stale_ping_verifications() {
             LOG_DHT_DEBUG("Ping verification timed out for candidate node " << node_id_to_hex(it->second.candidate_node.id) 
                           << " - candidate is unresponsive, keeping old node " << node_id_to_hex(it->second.old_node.id));
             
-            // Clean up the transaction mapping for this ping (if it was part of a search)
-            {
-                std::lock_guard<std::mutex> search_lock(pending_searches_mutex_);
-                auto trans_it = transaction_to_search_.find(it->first);
-                if (trans_it != transaction_to_search_.end()) {
-                    LOG_DHT_DEBUG("Removing transaction mapping for timed-out ping verification: " << it->first);
-                    transaction_to_search_.erase(trans_it);
-                }
-            }
-            
-            // Remove the old node from nodes_being_replaced set since the ping verification failed
+            // Remove tracking entries since the ping verification failed
             nodes_being_replaced_.erase(it->second.old_node.id);
             candidates_being_pinged_.erase(it->second.candidate_node.id);
             
