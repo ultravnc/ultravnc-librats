@@ -64,6 +64,7 @@
     </Lib>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\logger.cpp" />
     <ClCompile Include="src\socket.cpp" />
     <ClCompile Include="src\network_utils.cpp" />
     <ClCompile Include="src\dht.cpp" />
