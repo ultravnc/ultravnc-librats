@@ -254,7 +254,7 @@ public:
      * @param nat_config NAT traversal configuration
      * @param bind_address Interface IP address to bind to (empty for all interfaces)
      */
-    RatsClient(int listen_port, int max_peers = 10, const NatTraversalConfig& nat_config = NatTraversalConfig(), const std::string& bind_address = "");
+    RatsClient(int listen_port, int max_peers = 10, const NatTraversalConfig& nat_config = NatTraversalConfig(), const std::string& bind_address = "", const std::string& data_directory = ".");
     
     /**
      * Destructor

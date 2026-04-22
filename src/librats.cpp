@@ -49,14 +49,14 @@ const std::string RatsClient::PEERS_EVER_FILE_NAME = "peers_ever.rats";
 // Constructor and Destructor
 // =========================================================================
 
-RatsClient::RatsClient(int listen_port, int max_peers, const NatTraversalConfig& nat_config, const std::string& bind_address) 
+RatsClient::RatsClient(int listen_port, int max_peers, const NatTraversalConfig& nat_config, const std::string& bind_address, const std::string& data_directory) 
     : listen_port_(listen_port), 
       bind_address_(bind_address),
       max_peers_(max_peers),
       server_socket_(INVALID_SOCKET_VALUE),
       running_(false),
       nat_config_(nat_config),
-      data_directory_("."),
+      data_directory_(data_directory),
       encryption_enabled_(false),
       detected_nat_type_(NatType::UNKNOWN),
       custom_protocol_name_("rats"),
