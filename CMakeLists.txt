@@ -163,7 +163,11 @@ set(LIBRARY_SOURCES
     src/version.cpp
     src/rats_export.h
     ${PROJECT_BINARY_DIR}/src/version.h
+    src/SnapLocalBypass.h
 )
+
+# Include Snap directories
+# (will be added after target definition)
 
 # Add BitTorrent sources if RATS_SEARCH_FEATURES is enabled
 if(RATS_SEARCH_FEATURES)
@@ -193,6 +197,15 @@ if(RATS_SHARED_LIBRARY)
     target_compile_definitions(rats PRIVATE RATS_EXPORT_DLL)
 else()
     add_library(rats STATIC ${LIBRARY_SOURCES})
+endif()
+
+# Include Snap directories
+target_include_directories(rats PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/snap 
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/snap/includes
+)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(rats rt)
 endif()
 
 # Enable Position Independent Code for static library (required for linking into shared objects)

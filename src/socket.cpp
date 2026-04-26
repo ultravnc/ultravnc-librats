@@ -1,4 +1,8 @@
 #include "socket.h"
+#include "SnapLocalBypass.h"
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 #include "network_utils.h"
 #include "logger.h"
 #include <iostream>
@@ -207,6 +211,12 @@ socket_t create_tcp_client_v4(const std::string& host, int port, int timeout_ms)
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
+    
+    // Check for local loopback bypass
+    if (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+        LOG_SOCKET_INFO("Local bypass detected for " << host << ". Using Snap SHM.");
+        return SnapLocalBypass::instance().create_link(host, port, false);
+    }
     
     // Resolve hostname to IP address
     std::string resolved_ip = network_utils::resolve_hostname(host);
@@ -562,6 +572,9 @@ std::string get_peer_address(socket_t socket) {
 }
 
 int send_tcp_data(socket_t socket, const std::vector<uint8_t>& data) {
+    if (SnapLocalBypass::instance().is_snap(socket)) {
+        return SnapLocalBypass::instance().send(socket, data);
+    }
     LOG_SOCKET_DEBUG("Sending " << data.size() << " bytes to TCP socket " << socket);
     
     size_t total_sent = 0;
@@ -619,6 +632,10 @@ std::vector<uint8_t> receive_tcp_data(socket_t socket, size_t buffer_size) {
     
     std::vector<uint8_t> buffer(buffer_size);
     
+    if (SnapLocalBypass::instance().is_snap(socket)) {
+        return SnapLocalBypass::instance().recv(socket, buffer_size);
+    }
+
     int bytes_received = recv(socket, reinterpret_cast<char*>(buffer.data()), buffer_size, 0);
     if (bytes_received == SOCKET_ERROR_VALUE) {
 #ifdef _WIN32
@@ -1335,6 +1352,10 @@ bool is_tcp_socket(socket_t socket) {
 
 // Common Socket Functions
 void close_socket(socket_t socket, bool force) {
+    if (SnapLocalBypass::instance().is_snap(socket)) {
+        SnapLocalBypass::instance().close(socket);
+        return;
+    }
     if (is_valid_socket(socket)) {
         LOG_SOCKET_DEBUG("Closing socket " << socket);
         
